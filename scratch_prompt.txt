@@ -1,0 +1,515 @@
+<USER_REQUEST>
+M07 — FINAL CONVERGENCE / PRODUCTION ACCEPTANCE FIX
+====================================================
+
+Project: Scanora
+Milestone: M07 — Processing Engine Core
+
+IMPORTANT:
+This is NOT another micro-fix.
+Do not create M07-FIX-08, FIX-09, FIX-10, etc.
+Perform ONE consolidated production-grade correction pass.
+
+Do NOT rewrite the architecture.
+Do NOT touch M08+.
+Do NOT introduce OpenCV.
+Do NOT declare M07 PASS or LOCKED.
+The final verdict will be given after independent forensic review.
+
+====================================================
+1. AUTHORITATIVE SOURCE OF TRUTH
+====================================================
+
+The following contracts are frozen:
+
+- M03 AssetStore contract is authoritative for physical assets.
+- M04 PageEditState/cache identity is authoritative for semantic edit state.
+- M06 GeometryEngine is computation-only.
+- M07 is the authoritative raster-processing engine.
+- Raw capture is immutable source-of-truth.
+- processed.jpg and thumbnail.jpg are derived/cache artifacts.
+- SQLite cache metadata + physically valid derived assets together determine cache validity.
+- page ID is the only page identity; never use pageIndex as identity.
+- Production must use exactly ONE shared M07ProcessingEngine instance / shared processing lock.
+- Default heavy processing concurrency = 1.
+- Preview and final processing must use the same geometry/raster-processing semantics.
+- Typed Result/AppFailure error propagation is mandatory.
+
+====================================================
+2. CACHE IDENTITY — FIX COMPLETELY
+====================================================
+
+Use ONLY the canonical M04/M07 identities:
+
+Processed:
+PageCacheIdentity.forProcessed(...)
+
+Thumbnail:
+PageCacheIdentity.forThumbnail(
+  processedCacheKey,
+  width,
+  height,
+  quality,
+)
+
+Do NOT use:
+
+PageCacheIdentity.forState()
+
+for processed/thumbnail cache truth.
+
+Required behavior:
+
+A semantic edit changes:
+- corners
+- crop transform
+- rotation
+- processing profile
+- relevant output specification
+
+=> both processed_cache_key and thumbnail_cache_key become invalid/stale.
+
+Do NOT preserve old cache keys after an edit.
+
+savePageEditState() must invalidate cache metadata correctly.
+
+Remove any meaningless cache-key computation whose result is not used.
+
+====================================================
+3. markCacheCurrent() MUST VALIDATE CANONICAL IDENTITY
+====================================================
+
+markCacheCurrent() must NOT accept arbitrary non-empty strings.
+
+Before committing:
+
+1. Load the authoritative current page state.
+2. Verify page ID.
+3. Verify raw asset identity.
+4. Verify edit-state/revision identity.
+5. Recompute the canonical processed cache key.
+6. Recompute the canonical thumbnail cache key.
+7. Compare supplied keys with recomputed canonical keys.
+8. Verify processed and thumbnail assets physically exist and are non-zero.
+9. Commit only if all conditions match.
+
+An arbitrary key must fail even when:
+- raw identity matches
+- edit state matches
+- files exist.
+
+Use typed failure.
+
+====================================================
+4. STALE COMMIT / RACE SAFETY
+====================================================
+
+Fix the TOCTOU race:
+
+Current behavior:
+check page state
+-> later update DB
+
+This is insufficient.
+
+A stale processing request must NEVER commit cache metadata over a newer edit/raw state.
+
+Use an atomic revision/version/conditional-update strategy.
+
+The commit must succeed only when the page still has the same authoritative state captured when processing started.
+
+If state changed:
+- do not commit stale cache keys
+- do not claim success
+- do not replace authoritative cache metadata
+- return an appropriate typed result/failure according to existing architecture
+
+Test with actual concurrent stale commit.
+
+====================================================
+5. SAVE() MUST NOT OVERWRITE NEWER CACHE TRUTH
+====================================================
+
+Audit SqliteDocumentRepositoryV2.save().
+
+Current danger:
+an old ScanPage snapshot containing non-null processed/thumbnail cache keys can overwrite newer DB cache metadata.
+
+Fix this.
+
+Rules:
+
+- incoming NULL cache metadata may preserve current DB metadata where explicitly required.
+- stale NON-NULL cache metadata must NOT overwrite newer authoritative cache state.
+- page identity must be page.id.
+- pageIndex is ordering only.
+- preserve existing parent/page metadata correctly.
+- deleted pages must still be pruned.
+- deleted page assets must still be cleaned.
+
+Do not use SQLite REPLACE semantics where it can cause destructive parent/child behavior.
+
+====================================================
+6. AssetStore MUST BE MANDATORY FOR PRODUCTION CACHE TRUTH
+====================================================
+
+Production repository/cache validation must not have:
+
+AssetStore?
+
+for cache truth.
+
+Do not use:
+
+.valueOrNull ?? false
+
+to silently convert infrastructure errors into "asset missing".
+
+AssetStore failures must propagate as typed AppFailure/Result.
+
+Similarly:
+
+pathFor() failure must NOT silently fall back to arbitrary external rawSourcePath when canonical AssetStore storage is expected.
+
+Production processing must use canonical AssetStore-managed raw assets.
+
+====================================================
+7. PHYSICAL CACHE VALIDITY
+====================================================
+
+A cache is valid only when:
+
+DB processed key == canonical processed identity
+AND
+processed asset exists
+AND
+processed asset is non-zero
+
+AND for thumbnail:
+
+DB thumbnail key == canonical thumbnail identity
+AND
+thumbnail exists
+AND
+thumbnail is non-zero.
+
+If a derived file is:
+- missing
+- zero-byte
+- corrupt/unusable
+
+=> invalidate/reprocess appropriately.
+
+In-memory cache may optimize this but is NEVER authoritative.
+
+External deletion must evict stale in-memory cache state.
+
+====================================================
+8. RAW ASSET IDENTITY
+====================================================
+
+Audit the current:
+
+rawAssetIdentity = 'raw-v1'
+
+Do not change it blindly.
+
+If M03 guarantees raw assets are immutable/write-once, document and enforce that invariant.
+
+Otherwise use a deterministic raw-content/version identity.
+
+The important requirement:
+
+Changing raw source content must never incorrectly produce a cache HIT.
+
+Add/retain a real test proving this.
+
+====================================================
+9. ALREADY-CROPPED SEMANTICS
+====================================================
+
+The current behavior effectively maps alreadyCropped to full-frame corners and still runs the M07 raster pipeline.
+
+This must be made explicit.
+
+Define and implement the intended semantics:
+
+If alreadyCropped means the supplied image is already the final crop,
+M07 must NOT unnecessarily apply another perspective warp/resampling.
+
+If the architecture intentionally treats it as source geometry metadata instead,
+document that clearly and ensure callers/tests do not claim "already cropped bypass".
+
+Do not leave ambiguous behavior.
+
+Add a real behavioral test, not only a test that checks full-frame coordinates.
+
+====================================================
+10. WYSIWYG PREVIEW / FINAL PARITY
+====================================================
+
+Preview and saved processing must share:
+
+- M06 geometry calculation
+- M07 raster rendering
+- rotation semantics
+- output transformation semantics
+
+Do NOT claim pixel-for-pixel parity unless the test actually proves it.
+
+Add a meaningful parity test.
+
+At minimum verify:
+- same source
+- same corners
+- same rotation
+- same geometry
+- same output dimensions
+- equivalent rendered result according to a deterministic comparison.
+
+====================================================
+11. ROTATION
+====================================================
+
+M06 owns geometry calculation.
+
+M07 owns final raster rotation.
+
+Do NOT reintroduce double rotation.
+
+Keep the established rule:
+
+M07 geometry calculation receives rotationDegrees = 0
+and M07 performs the canonical final raster rotation.
+
+Verify:
+0 / 90 / 180 / 270
+using asymmetric images.
+
+====================================================
+12. ID CARD FLOW
+====================================================
+
+Preserve the existing special ID-card composition architecture.
+
+Authoritative pages remain:
+- front
+- back
+
+Each side must be processed through M07.
+
+Final dual-card composition may remain a presentation/export utility.
+
+Do NOT make the merged preview image the source-of-truth page.
+
+Also fix cached final ID-card export reuse:
+
+Before reusing cached PDF/image output, verify:
+- file exists
+- file is non-zero
+- semantic hash matches.
+
+Never reuse a missing/zero-byte cached export.
+
+Verify persisted front/back page cache metadata and physical derived files.
+
+====================================================
+13. PROCESSING FAILURE ATOMICITY
+====================================================
+
+A failed processing operation must never leave authoritative DB cache metadata claiming success.
+
+Failure cases to verify:
+
+- missing raw
+- corrupt raw
+- invalid geometry
+- unsupported filter
+- cancellation
+- processed save failure
+- thumbnail save failure
+- markCacheCurrent failure
+- stale commit
+
+Derived temporary/orphan files must be cleaned where required by the existing AssetStore atomic-write contract.
+
+====================================================
+14. CONCURRENCY
+====================================================
+
+Keep max heavy raster concurrency = 1.
+
+Verify:
+
+- same-page concurrent requests
+- different-page concurrent requests
+- FIFO behavior
+- queued cancellation
+- cancellation after acquire
+- forceReprocess
+- forceReprocess reference counting
+- normal request racing with forceReprocess
+- stale request cannot overwrite newer output/cache truth
+
+No large decoded bitmaps may be retained in controller fields, queues, or long-lived collections.
+
+One shared production lock/engine must be used.
+
+====================================================
+15. PROCESSING SERVICE
+====================================================
+
+Audit DocumentPageProcessingService.
+
+Fix:
+
+- swallowed AssetStore failures
+- arbitrary external raw-path fallback
+- duplicate raw read/decode where avoidable
+- pageIndex-based page identity
+- ambiguous alreadyCropped semantics
+- stale persistence interactions
+
+Do not introduce a second processing path.
+
+Production call graph must remain:
+
+Controller
+ -> DocumentPageProcessingService
+ -> M07ProcessingEngine
+ -> AssetStore / Repository
+
+====================================================
+16. REPOSITORY
+====================================================
+
+Audit all repository methods related to:
+
+- save()
+- savePage()
+- savePageEditState()
+- getProcessedCacheStatus()
+- getThumbnailCacheStatus()
+- markProcessedCacheCurrent()
+- markThumbnailCacheCurrent()
+- markCacheCurrent()
+
+Remove inconsistent cache identity logic.
+
+Ensure:
+
+- updatedAt remains updatedAt, not createdAt.
+- unknown filter values do not silently become Smart.
+- cache metadata is authoritative and race-safe.
+- AssetStore errors propagate.
+- parent/page relationships remain safe.
+
+====================================================
+17. REQUIRED REGRESSION TESTS
+====================================================
+
+Add or update tests for the ACTUAL failure modes.
+
+MANDATORY:
+
+1. valid physical assets + wrong arbitrary cache keys => reject
+2. semantic edit => both cache keys invalidated
+3. stale non-null save snapshot cannot overwrite newer cache metadata
+4. concurrent stale markCacheCurrent cannot win
+5. AssetStore failure propagates
+6. missing derived asset invalidates cache
+7. zero-byte derived asset invalidates cache
+8. raw content/version change invalidates cache
+9. alreadyCropped has verified behavior
+10. preview/final parity
+11. ID-card persisted front/back cache truth
+12. cached ID-card export missing/zero-byte => regenerate
+13. forceReprocess race
+14. same-page concurrent processing
+15. 50-page real processing benchmark
+
+Do not write fake tests that merely reproduce implementation assumptions.
+
+Tests must exercise real FileSystemAssetStore + real JPEG files + real SQLite wherever the production integration behavior is being verified.
+
+====================================================
+18. PERFORMANCE
+====================================================
+
+Run:
+
+- 1-page cold
+- 10-page cold
+- 20-page cold
+- 50-page cold
+- 50-page cache hit
+
+Record:
+
+- total time
+- average/page
+- max heavy jobs
+- failures
+- peak memory if available
+
+Do NOT invent numbers.
+
+====================================================
+19. VALIDATION
+====================================================
+
+Run:
+
+flutter analyze
+
+focused M07 tests
+
+M07 production integration tests
+
+full Flutter test suite
+
+Android debug APK build
+
+If iOS remains blocked by the known pre-existing ML Kit deployment-target issue, report it separately and do not misrepresent it as an M07 failure.
+
+====================================================
+20. FINAL REPORT FORMAT
+====================================================
+
+Report ONLY actual evidence.
+
+Include:
+
+A. Files changed
+B. Architectural changes
+C. Cache identity proof
+D. Persistence/race proof
+E. AssetStore/error propagation proof
+F. alreadyCropped behavior
+G. WYSIWYG parity evidence
+H. ID-card evidence
+I. concurrency evidence
+J. performance evidence
+K. test counts
+L. analyze result
+M. Android build result
+N. remaining limitations
+
+IMPORTANT:
+
+Do NOT write:
+"M07 PASS"
+"M07 COMPLETE"
+"M07 LOCKED"
+
+The milestone will be independently reviewed after this implementation.
+
+If any required item cannot be proven, explicitly mark it as NOT PROVEN rather than claiming success.
+
+====================================================
+END — ONE CONSOLIDATED PASS ONLY
+====================================================
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-09-13T12:18:55+06:00.
+</ADDITIONAL_METADATA>
